@@ -1,0 +1,13 @@
+# Bỏ qua dataset
+data/
+*.wav
+*.jpg
+*.png
+
+# Bỏ qua môi trường ảo
+venv/
+
+# Bỏ qua các file tạm thời
+__pycache__/
+*.pyc
+.DS_Store
