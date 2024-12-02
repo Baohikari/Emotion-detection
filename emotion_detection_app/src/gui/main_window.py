@@ -1,7 +1,15 @@
 import tkinter as tk
 import cv2
+import os
+import numpy as np
 from PIL import Image, ImageTk
 from tf_keras.models import load_model
+import pyaudio
+import threading
+import librosa
+import pickle
+import wave
+
 class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -18,6 +26,14 @@ class MainWindow(tk.Tk):
         self.title_label.grid(row=0, column=0, columnspan=2, pady=10, sticky='nsew')
 
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+        #Tải mô hình cảm xúc
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        model_path = os.path.join(project_root, 'models', 'best_emotion_model.h5')
+        print("Đường dẫn là: ", model_path)
+        self.emotion_model = load_model(model_path)
+        #Các cảm xúc
+        self.emotion_labels = ['Angry', 'Happy', 'Sad', 'Surprised', 'Fearful', 'Disgusted', 'Neutral']
         #Tạo các text widget cho row1, row2, row3
         self.text_widget_intro = tk.Text(self,
                                           bg='mistyrose',
@@ -117,6 +133,8 @@ class MainWindow(tk.Tk):
         if not self.is_camera_running:
             self.cap = cv2.VideoCapture(0)
             self.is_camera_running = True
+            self.audio_thread = threading.Thread(target=self.start_audio_recording)
+            self.audio_thread.start()
             self.update_frame()
 
     def stop_camera(self):
@@ -124,25 +142,85 @@ class MainWindow(tk.Tk):
             self.is_camera_running = False
             if self.cap:
                 self.cap.release()
+            if self.stream:
+                self.stream.stop_stream()
+                self.stream.close()
             self.camera_label.config(image='')
+    def start_audio_recording(self):
+        p = pyaudio.PyAudio()
+        self.stream = p.open(format=pyaudio.paInt16,
+                             channels=1,
+                             rate=44100,
+                             input=True,
+                             frames_per_buffer=1024)
+        self.audio_frames = []
+        while self.is_camera_running:
+            data = self.stream.read(1024)
+            self.audio_frames.append(data)
+    
+    def process_audio_and_predict_emotion(self):
+        if self.audio_frames:
+            audio_data = b''.join(self.audio_frames)
+            temp_wav_path = "temp_audio.wav"
+            with wave.open(temp_wav_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(pyaudio.PyAudio().get_sample_size(pyaudio.paInt16))
+                wf.setframerate(44100)
+                wf.writeframes(audio_data)
+            y, sr = librosa.load(temp_wav_path, sr=44100)
+            mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+            mfccs_mean = np.mean(mfccs.T, axis=0)
+
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            audio_model_path = os.path.join(project_root, 'models', 'audio_emotion_model.pkl')
+            with open(audio_model_path, 'rb') as f:
+                audio_model = pickle.load(f)
+            
+            predicted_emotion = audio_model.predict([mfccs_mean])[0]
+
+            # Hiển thị kết quả
+            print(f"Cảm xúc giọng nói: {predicted_emotion}")
+            self.text_widget_use.config(state='normal')
+            self.text_widget_use.insert('end', f"\nCảm xúc giọng nói: {predicted_emotion}", 'normal')
+            self.text_widget_use.config(state='disabled')
+            
+        os.remove(temp_wav_path)
 
     def update_frame(self):
         if self.is_camera_running and self.cap.isOpened():
             ret, frame = self.cap.read()
             if ret:
                 frame = cv2.flip(frame, 1)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                # Phát hiện khuôn mặt
                 faces = self.face_cascade.detectMultiScale(frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
                 
                 for (x, y, w, h) in faces:
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+                    # Cắt khuôn mặt ra để phân tích cảm xúc
+                    face_roi = frame[y:y + h, x:x + w]
+                    face_roi_rgb = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
+                    face_roi_resized = cv2.resize(face_roi_rgb, (48, 48))  # Resize về kích thước phù hợp với mô hình
+
+                    # Tiền xử lý ảnh khuôn mặt
+                    face_roi_normalized = face_roi_resized / 255.0
+                    face_roi_gray = cv2.cvtColor(face_roi_resized, cv2.COLOR_RGB2GRAY)  # Chuyển ảnh về grayscale
+                    face_roi_reshaped = np.expand_dims(face_roi_gray, axis=0)  # Thêm batch dimension
+                    face_roi_reshaped = np.expand_dims(face_roi_reshaped, axis=-1)  # Thêm channel dimension (1)
+
+                    # Dự đoán cảm xúc từ khuôn mặt
+                    emotion_prediction = self.emotion_model.predict(face_roi_reshaped)
+                    max_index = np.argmax(emotion_prediction[0])
+                    predicted_emotion = self.emotion_labels[max_index]
+
+                    # Hiển thị cảm xúc dự đoán lên khung hình
+                    cv2.putText(frame, predicted_emotion, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
                 img = Image.fromarray(frame)
                 imgtk = ImageTk.PhotoImage(image=img)
                 self.camera_label.imgtk = imgtk
                 self.camera_label.config(image=imgtk)
+
             self.camera_label.after(10, self.update_frame)
-
-
-if __name__ == '__main__':
-    app = MainWindow()
-    app.mainloop()
